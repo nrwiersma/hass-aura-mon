@@ -167,7 +167,7 @@ class AuraMonSensor(CoordinatorEntity[AuraMonDataUpdateCoordinator], SensorEntit
         self.entity_description = entity_description
         mac = coordinator.data.mac or coordinator.config_entry.entry_id
         self._attr_unique_id = f"{mac}_{device_name}_{entity_description.key}"
-        self._attr_name = f"{device_name} {entity_description.key.replace('_', ' ')}"
+        self._attr_name = device_name
 
     @property
     def device_info(self) -> DeviceInfo:
