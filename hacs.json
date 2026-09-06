@@ -1,0 +1,6 @@
+{
+  "name": "Aura Mon",
+  "hacs": "1.6.0",
+  "homeassistant": "2026.8",
+  "render_readme": true
+}

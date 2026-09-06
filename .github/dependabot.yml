@@ -1,0 +1,16 @@
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      # Dependabot must not bump this on its own: the minimum Home Assistant version
+      # supported must always match the "homeassistant" key in hacs.json. Bump both
+      # together by hand (or in the same PR) instead.
+      - dependency-name: "homeassistant"
