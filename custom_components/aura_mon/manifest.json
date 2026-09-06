@@ -5,9 +5,9 @@
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/nrwiersma/hass-aura-mon",
-  "issue_tracker": "https://github.com/nrwiersma/hass-aura-mon/issues",
   "integration_type": "device",
   "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/nrwiersma/hass-aura-mon/issues",
   "requirements": [],
   "version": "0.1.0"
 }
