@@ -11,8 +11,10 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import AuraMonClient, DeviceEnergy, EnergyRow
 from .const import (
+    CATCH_UP_RESYNC_OFFSET,
     CONNECTION_ERRORS,
     DEFAULT_UPDATE_INTERVAL,
+    MAX_CATCH_UP_AGE,
     MAX_UPDATE_INTERVAL,
     MIN_UPDATE_INTERVAL,
 )
@@ -128,29 +130,44 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
             _LOGGER.debug("Datalog timestamp regressed, resyncing energy totals")
             self._last_ts = None
 
+        # If we've fallen too far behind (e.g. HA was stopped for a while), don't bother
+        # replaying the whole gap row-by-row - just resync close to the device's current
+        # datalog timestamp. Losing some history is fine; we don't want long/expensive
+        # catch-up reads for no reason.
+        if self._last_ts is not None and last_ts - self._last_ts > MAX_CATCH_UP_AGE:
+            _LOGGER.debug("Last sync is over an hour old, skipping ahead")
+            self._last_ts = max(last_ts - CATCH_UP_RESYNC_OFFSET, 0)
+
         if self._last_ts is None:
             # First run (or resync): only fetch the most recent interval so we don't replay
             # the device's entire history into the accumulated energy totals.
             start = max(last_ts - interval, 0)
         else:
             start = self._last_ts
+        end = last_ts
 
         rows: list[EnergyRow] = []
-        if last_ts and start < last_ts:
+        if last_ts and start < end:
             try:
                 rows = await self.client.get_energy(
-                    start=start, end=last_ts, interval=interval
+                    start=start, end=end, interval=interval
                 )
             except CONNECTION_ERRORS as err:
                 raise UpdateFailed(f"Error fetching energy data: {err}") from err
 
-        for row in rows:
-            for name, energy in row.devices.items():
-                self._energy_totals[name] = (
-                    self._energy_totals.get(name, 0.0) + energy.energy_wh
-                )
-            if row.timestamp > (self._last_ts or 0):
-                self._last_ts = row.timestamp
+        if rows:
+            for row in rows:
+                for name, energy in row.devices.items():
+                    self._energy_totals[name] = (
+                        self._energy_totals.get(name, 0.0) + energy.energy_wh
+                    )
+                if row.timestamp > (self._last_ts or 0):
+                    self._last_ts = row.timestamp
+        elif last_ts and start < end:
+            # The device had nothing for the requested window (e.g. a gap in the log).
+            # Move the window forward by its own size rather than re-requesting the same
+            # empty range forever.
+            self._last_ts = min(start + (end - start), last_ts)
 
         if self._last_ts is None:
             self._last_ts = last_ts
