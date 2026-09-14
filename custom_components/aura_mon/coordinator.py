@@ -4,12 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import timedelta
 import logging
+import time
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import AuraMonClient, DeviceEnergy, EnergyRow
+from .api import AuraMonClient, DeviceEnergy, EnergyRow, StatusResponse
 from .const import (
     CATCH_UP_RESYNC_OFFSET,
     CONNECTION_ERRORS,
@@ -17,6 +18,7 @@ from .const import (
     MAX_CATCH_UP_AGE,
     MAX_UPDATE_INTERVAL,
     MIN_UPDATE_INTERVAL,
+    STATUS_UPDATE_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,7 +56,13 @@ class AuraMonData:
 
 
 class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
-    """Coordinator that polls an AuraMon device's /status and /energy endpoints."""
+    """Coordinator that polls an AuraMon device's /status and /energy endpoints.
+
+    /energy is polled every `update_interval` (matching the device's own datalog
+    interval). /status is only refreshed every STATUS_UPDATE_INTERVAL.
+    Between /status refreshes, the /energy query window is derived purely from wall-clock
+    time rather than from the device's `datalog.last_ts`.
+    """
 
     config_entry: AuraMonConfigEntry
 
@@ -67,6 +75,12 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
         # Last datalog timestamp we've folded into the accumulated energy totals.
         self._last_ts: int | None = None
         self._interval = DEFAULT_UPDATE_INTERVAL
+
+        # Cached GET /status response and the monotonic time it was fetched at. /status is
+        # only refetched every STATUS_UPDATE_INTERVAL (see class docstring); in between,
+        # this cache is reused for device names, version, network/mac, and datalog.interval.
+        self._status: StatusResponse | None = None
+        self._status_fetched_at: float | None = None
         # Running per-device energy totals (Wh), since the /energy endpoint only reports
         # per-interval deltas rather than a cumulative value.
         self._energy_totals: dict[str, float] = {}
@@ -108,12 +122,27 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
         if self.data is not None and device_name in self.data.devices:
             self.data.devices[device_name].energy_total = total
 
-    async def _async_update_data(self) -> AuraMonData:
-        """Fetch the latest status and any new energy data from the device."""
+    async def _async_get_status(self) -> StatusResponse:
+        """Return the device status, refreshing it only every STATUS_UPDATE_INTERVAL.
+
+        /status is used to reconcile the devices and last logged timestamp. It is not
+        necessary to poll this on every update as this information moves slowly.
+        """
+        now_monotonic = time.monotonic()
+        if (
+            self._status is not None
+            and self._status_fetched_at is not None
+            and now_monotonic - self._status_fetched_at < STATUS_UPDATE_INTERVAL
+        ):
+            return self._status
+
         try:
             status = await self.client.get_status()
         except CONNECTION_ERRORS as err:
             raise UpdateFailed(f"Error communicating with device: {err}") from err
+
+        self._status = status
+        self._status_fetched_at = now_monotonic
 
         datalog = status.datalog
         interval = datalog.interval if datalog and datalog.interval else DEFAULT_UPDATE_INTERVAL
@@ -141,17 +170,26 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
         if self._last_ts is None:
             # First run (or resync): only fetch the most recent interval so we don't replay
             # the device's entire history into the accumulated energy totals.
-            start = max(last_ts - interval, 0)
-        else:
-            start = self._last_ts
-        end = last_ts
+            self._last_ts = max(last_ts - interval, 0)
+
+        return status
+
+    async def _async_update_data(self) -> AuraMonData:
+        """Fetch any new energy data, refreshing /status only every so often."""
+        status = await self._async_get_status()
+        interval = self._interval
+
+        # `limit_ts` is used as a pacing boundary, ensuring the data requested has been logged.
+        now = time.time()
+        limit_ts = int(now // interval) * interval - interval
+
+        start = self._last_ts
 
         rows: list[EnergyRow] = []
-        if last_ts and start < end:
+        attempted = start is not None and start < limit_ts
+        if attempted:
             try:
-                rows = await self.client.get_energy(
-                    start=start, end=end, interval=interval
-                )
+                rows = await self.client.get_energy(start=start, interval=interval)
             except CONNECTION_ERRORS as err:
                 raise UpdateFailed(f"Error fetching energy data: {err}") from err
 
@@ -163,14 +201,12 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
                     )
                 if row.timestamp > (self._last_ts or 0):
                     self._last_ts = row.timestamp
-        elif last_ts and start < end:
+        elif attempted:
             # The device had nothing for the requested window (e.g. a gap in the log).
-            # Move the window forward by its own size rather than re-requesting the same
-            # empty range forever.
-            self._last_ts = min(start + (end - start), last_ts)
-
-        if self._last_ts is None:
-            self._last_ts = last_ts
+            # We know for certain there's no data before limit_ts (we waited a full
+            # interval past it before attempting), so skip past the gap up to there
+            # rather than re-requesting the same empty range forever.
+            self._last_ts = limit_ts
 
         if rows:
             # Merge rather than replace: a malformed/short CSV row (see
@@ -179,9 +215,10 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
             self._latest_readings.update(rows[-1].devices)
             self._latest_hz = rows[-1].hz
 
-        # /status is only used here for the set of configured device names; the actual
-        # electrical readings come exclusively from /energy (see _latest_readings above),
-        # since /energy's interval-aggregated values match what's logged, unlike /status's
+        # /status is only used here for the set of configured device names (refreshed at
+        # most every STATUS_UPDATE_INTERVAL, see _async_get_status); the actual electrical
+        # readings come exclusively from /energy (see _latest_readings above), since
+        # /energy's interval-aggregated values match what's logged, unlike /status's
         # instantaneous snapshot.
         devices: dict[str, AuraMonDeviceData] = {
             dev.name: AuraMonDeviceData(
