@@ -176,8 +176,12 @@ class AuraMonSensor(CoordinatorEntity[AuraMonDataUpdateCoordinator], SensorEntit
 
     @property
     def available(self) -> bool:
-        """Return whether the underlying device data is still present."""
-        return super().available and self._device_name in self.coordinator.data.devices
+        """Return whether the underlying device data is still present and fresh."""
+        return (
+            super().available
+            and self._device_name in self.coordinator.data.devices
+            and not self.coordinator.data.stale
+        )
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -248,6 +252,11 @@ class AuraMonFrequencySensor(CoordinatorEntity[AuraMonDataUpdateCoordinator], Se
     def device_info(self) -> DeviceInfo:
         """Return device info."""
         return _device_info(self.coordinator)
+
+    @property
+    def available(self) -> bool:
+        """Return whether the push feed is still fresh."""
+        return super().available and not self.coordinator.data.stale
 
     @property
     def native_value(self) -> float:

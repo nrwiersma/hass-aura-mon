@@ -1,14 +1,12 @@
 """Async client for the AuraMon device HTTP API.
 
-See firmware/API.md in the aura-mon repo for the full API description. This client only
-implements the read-only endpoints needed by the Home Assistant integration: ``GET /status``
-and ``GET /energy``.
+See firmware/API.md in the aura-mon repo for the full API description. Live readings are
+pushed to Home Assistant via a webhook (see WEBHOOK_INGESTION.md), so this client only
+implements ``GET /status``, used for device identity/firmware metadata.
 """
 from __future__ import annotations
 
 import asyncio
-import csv
-import io
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -59,27 +57,6 @@ class StatusResponse:
     devices: list[DeviceStatus] = field(default_factory=list)
     datalog: DatalogInfo | None = None
     network: NetworkInfo | None = None
-
-
-@dataclass
-class DeviceEnergy:
-    """A single device's columns in one GET /energy row."""
-
-    name: str
-    voltage: float
-    current: float
-    power: float
-    energy_wh: float
-    power_factor: float
-
-
-@dataclass
-class EnergyRow:
-    """A single row (interval) from GET /energy."""
-
-    timestamp: int
-    hz: float
-    devices: dict[str, DeviceEnergy] = field(default_factory=dict)
 
 
 class AuraMonClient:
@@ -143,60 +120,3 @@ class AuraMonClient:
             datalog=datalog,
             network=network,
         )
-
-    async def get_energy(
-        self, start: int, end: int | None = None, interval: int | None = None
-    ) -> list[EnergyRow]:
-        """Fetch and parse GET /energy, returning [] on 204 (no new data)."""
-        params: dict[str, str] = {"start": str(start)}
-        if end is not None:
-            params["end"] = str(end)
-        if interval is not None:
-            params["interval"] = str(interval)
-
-        async with asyncio.timeout(self._timeout):
-            async with self._session.get(self._url("/energy"), params=params) as resp:
-                if resp.status == 204:
-                    return []
-                resp.raise_for_status()
-                text = await resp.text()
-
-        return self._parse_energy_csv(text)
-
-    @staticmethod
-    def _parse_energy_csv(text: str) -> list[EnergyRow]:
-        """Parse the `/energy` CSV body into EnergyRow objects."""
-        reader = csv.reader(io.StringIO(text))
-        try:
-            header = next(reader)
-        except StopIteration:
-            return []
-
-        # header: timestamp, Hz, <name>.V, <name>.A, <name>.W, <name>.Wh, <name>.PF, ...
-        device_names: list[str] = []
-        for col in header[2:]:
-            if col.endswith(".V"):
-                device_names.append(col[: -len(".V")])
-
-        rows: list[EnergyRow] = []
-        for raw_row in reader:
-            if not raw_row:
-                continue
-            timestamp = int(float(raw_row[0]))
-            hz = float(raw_row[1])
-            devices: dict[str, DeviceEnergy] = {}
-            for i, name in enumerate(device_names):
-                base = 2 + i * 5
-                if base + 5 > len(raw_row):
-                    break
-                devices[name] = DeviceEnergy(
-                    name=name,
-                    voltage=float(raw_row[base]),
-                    current=float(raw_row[base + 1]),
-                    power=float(raw_row[base + 2]),
-                    energy_wh=float(raw_row[base + 3]),
-                    power_factor=float(raw_row[base + 4]),
-                )
-            rows.append(EnergyRow(timestamp=timestamp, hz=hz, devices=devices))
-
-        return rows

@@ -9,21 +9,22 @@ import aiohttp
 DOMAIN = "aura_mon"
 
 DEFAULT_TIMEOUT = 10
-# Lower bound on how often we poll the device, regardless of its datalog interval.
-MIN_UPDATE_INTERVAL = 5
-# Upper bound so a misbehaving/huge datalog interval doesn't stall updates for too long.
-MAX_UPDATE_INTERVAL = 60
-# Fallback used if the device hasn't reported a datalog interval yet.
-DEFAULT_UPDATE_INTERVAL = 30
 
-# If our last synced datalog timestamp is further behind the device's current one than
-# this, don't bother trying to catch up row-by-row - just skip ahead. Losing some history
-# is fine; we don't want long/expensive catch-up reads for no reason.
-MAX_CATCH_UP_AGE = 3600
-# When skipping ahead (see MAX_CATCH_UP_AGE), resume this far behind the device's current
-# datalog timestamp instead of jumping all the way to it, so a snapshot of very recent
-# energy deltas isn't lost.
-CATCH_UP_RESYNC_OFFSET = 600
+CONF_WEBHOOK_ID = "webhook_id"
+
+# Live readings arrive via a push webhook (see WEBHOOK_INGESTION.md), not polling. GET
+# /status is only used for device identity/firmware metadata, refreshed on: initial setup,
+# an unknown device name appearing in a webhook payload, and the two timers below.
+
+# Unconditional periodic /status refresh, so firmware/version/network changes are picked up
+# even while webhook payloads keep flowing normally and the known device set never changes.
+STATUS_REFRESH_INTERVAL = 1800
+
+# How often the staleness watchdog checks for a missing webhook payload.
+STALE_CHECK_INTERVAL = 60
+# If no webhook payload has landed for this long, trigger a /status refresh (reachability
+# check/diagnostics) and mark entities unavailable, regardless of that refresh's outcome.
+STALE_THRESHOLD = 300
 
 CONNECTION_ERRORS = (
     aiohttp.ClientError,
