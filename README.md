@@ -4,9 +4,9 @@ A [Home Assistant](https://www.home-assistant.io/) custom integration for
 [AuraMon](https://github.com/nrwiersma/aura-mon) energy monitors, installable via
 [HACS](https://hacs.xyz/) as a custom repository.
 
-It polls the AuraMon device's local HTTP API (no cloud, no account) to expose per-circuit
-electrical sensors in Home Assistant, including energy sensors compatible with the
-Home Assistant Energy dashboard.
+It receives pushed readings over a webhook from the AuraMon device's firmware (no cloud, no
+account) to expose per-circuit electrical sensors in Home Assistant, including energy sensors
+compatible with the Home Assistant Energy dashboard.
 
 ## Installation
 
@@ -26,7 +26,12 @@ directory and restart Home Assistant.
 1. In Home Assistant, go to **Settings > Devices & Services > Add Integration**.
 2. Search for **Aura Mon**.
 3. Enter the IP address or hostname of your AuraMon device (e.g. `aura-mon.local` or
-   `192.168.1.50`). No authentication is required.
+   `192.168.1.50`). No authentication is required. This is used once to validate the device
+   and read its identity (MAC/version/device list) — it is not polled afterwards.
+4. The integration then generates a webhook URL and shows it to you. Copy it into the
+   device's `homeassistant` uploader settings (`url`/`webhook_id`) so the firmware can start
+   pushing readings — this is a manual, one-time step; the integration can't configure the
+   device's uploader for you.
 
 ## Entities
 
@@ -38,10 +43,10 @@ with the following entities:
 For each configured/enabled circuit on the device:
 
 - **Power** (W) — enabled by default.
-- **Energy** (Wh) — enabled by default. Compatible with the Energy dashboard. The AuraMon API
-  only reports the energy consumed during each logging interval, not a running total, so this
-  integration accumulates those deltas into a persistent running total that survives Home
-  Assistant restarts.
+- **Energy** (Wh) — enabled by default. Compatible with the Energy dashboard. Each push only
+  reports the energy consumed during that interval, not a running total, so this integration
+  accumulates those deltas into a persistent running total that survives Home Assistant
+  restarts.
 - **Voltage** (V) — disabled by default.
 - **Current** (A) — disabled by default.
 - **Power factor** (%) — disabled by default.
@@ -49,11 +54,15 @@ For each configured/enabled circuit on the device:
 Disabled-by-default entities can be enabled from the entity's settings in Home Assistant if
 you want them.
 
-## Polling
+## Data flow
 
-The integration polls the device's `/status` and `/energy` endpoints at the device's own
-datalog interval (bounded between 5 and 60 seconds), so updates stay in sync with what the
-AuraMon firmware is actually logging.
+The integration does not poll the device for live readings. The firmware pushes readings to
+Home Assistant over a webhook (default/recommended interval: 30s), and the integration
+accumulates each push's energy delta into a running total. `GET /status` (device
+identity/firmware metadata) is only fetched rarely: once at setup, on-demand when a push
+mentions a device name not seen before, every 30 minutes regardless (to catch firmware/version
+changes), and after 5 minutes without any push (as a reachability check). If no push arrives
+for 5 minutes, all entities go unavailable until pushes resume.
 
 ## See also
 
