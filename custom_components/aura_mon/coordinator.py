@@ -91,6 +91,11 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
 
         self._last_webhook_at: float | None = None
         self._stale = False
+        # The last payload `ts` we actually accumulated energy for. Firmware retries a POST
+        # indefinitely until it gets a 200 back (see WEBHOOK_INGESTION.md), so a lost response
+        # can cause the same interval to be resent; guard against double-counting its `wh`
+        # delta by only accumulating payloads with a strictly newer `ts`.
+        self._last_processed_ts: int | None = None
 
         super().__init__(
             hass=hass,
@@ -146,7 +151,17 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
         return self._build_snapshot()
 
     def handle_payload(self, body: dict) -> None:
-        """Handle a parsed webhook payload (see WEBHOOK_INGESTION.md §2)."""
+        """Handle a parsed webhook payload (see WEBHOOK_INGESTION.md §2).
+
+        Assumes `body` is a JSON object (validated by the webhook handler); every field
+        within it is otherwise untrusted and validated here.
+        """
+        try:
+            ts = int(body["ts"])
+        except (KeyError, TypeError, ValueError):
+            _LOGGER.warning("Ignoring webhook payload with missing/invalid ts: %r", body.get("ts"))
+            return
+
         self._last_webhook_at = time.monotonic()
         self._stale = False
 
@@ -156,10 +171,35 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
             except (TypeError, ValueError):
                 _LOGGER.debug("Ignoring non-numeric hz in webhook payload: %r", body.get("hz"))
 
+        # Guard against double-counting energy from a retried/out-of-order delivery (see
+        # `_last_processed_ts`'s docstring in __init__). Readings/hz above are still applied
+        # even on a duplicate, since re-applying the same values is harmless and keeps
+        # `_last_webhook_at`/`_stale` accurate either way.
+        if self._last_processed_ts is not None and ts <= self._last_processed_ts:
+            _LOGGER.debug(
+                "Ignoring duplicate/out-of-order webhook payload (ts=%s, last processed=%s)",
+                ts,
+                self._last_processed_ts,
+            )
+            self.async_set_updated_data(self._build_snapshot())
+            return
+        self._last_processed_ts = ts
+
+        devices = body.get("devices")
+        if devices is None:
+            devices = []
+        elif not isinstance(devices, list):
+            _LOGGER.warning("Ignoring webhook payload with non-list devices: %r", devices)
+            devices = []
+
         unknown_device = False
-        for device in body.get("devices") or []:
+        for device in devices:
+            if not isinstance(device, dict):
+                _LOGGER.debug("Ignoring non-object device entry in webhook payload: %r", device)
+                continue
             name = device.get("name")
-            if not name:
+            if not isinstance(name, str) or not name:
+                _LOGGER.debug("Ignoring device entry with missing/invalid name: %r", device)
                 continue
             try:
                 reading = _Reading(
