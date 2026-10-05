@@ -33,6 +33,11 @@ directory and restart Home Assistant.
    pushing readings — this is a manual, one-time step; the integration can't configure the
    device's uploader for you.
 
+   If you don't see this step (e.g. you're updating an existing Aura Mon entry from before
+   push support was added), check the notifications bell icon in Home Assistant's top
+   toolbar after restarting — the integration posts a one-time notification with the webhook
+   URL the first time it starts up without one.
+
 ## Entities
 
 The integration creates one Home Assistant device (identified by the AuraMon's MAC address)
