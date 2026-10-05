@@ -9,7 +9,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components import webhook
 from homeassistant.const import CONF_HOST
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -97,6 +97,42 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         webhook_url = webhook.async_generate_url(self.hass, self._webhook_id)
         return self.async_show_form(
             step_id="webhook",
+            data_schema=vol.Schema({}),
+            description_placeholders={"webhook_url": webhook_url},
+        )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> OptionsFlowHandler:
+        """Return the options flow, used to re-display the webhook URL on demand."""
+        return OptionsFlowHandler()
+
+
+class OptionsFlowHandler(config_entries.OptionsFlow):
+    """Options flow that just re-displays the entry's webhook URL.
+
+    There's nothing to actually configure - this exists purely so the webhook URL (shown
+    only once, during initial setup) is always reachable afterwards via the integration's
+    "Configure" button, rather than relying on a one-time notification/log line.
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Show the webhook URL."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data={})
+
+        webhook_id = self.config_entry.data.get(CONF_WEBHOOK_ID)
+        webhook_url = (
+            webhook.async_generate_url(self.hass, webhook_id)
+            if webhook_id
+            else "Not yet generated - reload the integration to generate one."
+        )
+        return self.async_show_form(
+            step_id="init",
             data_schema=vol.Schema({}),
             description_placeholders={"webhook_url": webhook_url},
         )

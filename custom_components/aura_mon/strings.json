@@ -19,6 +19,13 @@
       "already_configured": "Device is already configured"
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "description": "This is the webhook URL for this Aura Mon device. Paste it into the device's Home Assistant uploader settings (`url`/`webhook_id`) if it isn't receiving data:\n\n`{webhook_url}`"
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "voltage": {
