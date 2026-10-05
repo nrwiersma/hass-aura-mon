@@ -38,7 +38,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: AuraMonConfigEntry) -> b
             entry, data={**entry.data, CONF_WEBHOOK_ID: webhook_id}
         )
         webhook_url = ha_webhook.async_generate_url(hass, webhook_id)
-        _LOGGER.info("Generated new AuraMon webhook URL for %s: %s", entry.title, webhook_url)
+        _LOGGER.warning("Generated new AuraMon webhook URL for %s: %s", entry.title, webhook_url)
         persistent_notification.async_create(
             hass,
             (
