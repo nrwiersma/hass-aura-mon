@@ -6,6 +6,9 @@
           "host": "Host"
         },
         "description": "Enter the IP address or hostname of your AuraMon device."
+      },
+      "webhook": {
+        "description": "Setup is almost done. Readings are pushed to Home Assistant rather than polled, so copy this webhook URL into the device's Home Assistant uploader settings (`url`/`webhook_id`):\n\n`{webhook_url}`"
       }
     },
     "error": {

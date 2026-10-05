@@ -1,4 +1,4 @@
-"""DataUpdateCoordinator for the AuraMon integration."""
+"""Push-driven DataUpdateCoordinator for the AuraMon integration."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -8,29 +8,25 @@ import time
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import AuraMonClient, DeviceEnergy, EnergyRow, StatusResponse
-from .const import (
-    CATCH_UP_RESYNC_OFFSET,
-    CONNECTION_ERRORS,
-    DEFAULT_UPDATE_INTERVAL,
-    MAX_CATCH_UP_AGE,
-    MAX_UPDATE_INTERVAL,
-    MIN_UPDATE_INTERVAL,
-    STATUS_UPDATE_INTERVAL,
-)
+from .api import AuraMonClient, StatusResponse
+from .const import CONNECTION_ERRORS, STALE_CHECK_INTERVAL, STALE_THRESHOLD, STATUS_REFRESH_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
 type AuraMonConfigEntry = ConfigEntry[AuraMonDataUpdateCoordinator]
 
-# Placeholder used when a device has no /energy reading yet (e.g. before the first
-# interval has been fetched), so live sensor values default to 0.0 rather than falling
-# back to /status's instantaneous snapshot.
-_EMPTY_READING = DeviceEnergy(
-    name="", voltage=0.0, current=0.0, power=0.0, energy_wh=0.0, power_factor=0.0
-)
+
+@dataclass
+class _Reading:
+    """Latest known electrical reading for a single device, from a webhook payload."""
+
+    voltage: float
+    current: float
+    power: float
+    power_factor: float
 
 
 @dataclass
@@ -53,15 +49,24 @@ class AuraMonData:
     mac: str
     hz: float
     devices: dict[str, AuraMonDeviceData] = field(default_factory=dict)
+    # True once no webhook payload has landed for STALE_THRESHOLD seconds - entities should
+    # treat this as "no longer available" regardless of their last known values.
+    stale: bool = False
 
 
 class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
-    """Coordinator that polls an AuraMon device's /status and /energy endpoints.
+    """Coordinator fed by a push webhook rather than polling.
 
-    /energy is polled every `update_interval` (matching the device's own datalog
-    interval). /status is only refreshed every STATUS_UPDATE_INTERVAL.
-    Between /status refreshes, the /energy query window is derived purely from wall-clock
-    time rather than from the device's `datalog.last_ts`.
+    Live readings arrive exclusively via `handle_payload()`, called from the webhook
+    handler. `GET /status` (device identity: version/mac/network/device list) is only
+    fetched:
+
+    - Once, during `async_config_entry_first_refresh()` at setup.
+    - On-demand (debounced) when a webhook payload names a device not currently known.
+    - Unconditionally every `STATUS_REFRESH_INTERVAL` seconds, to catch firmware/version
+      changes even while payloads keep flowing normally for an unchanged device set.
+    - On-demand when no webhook payload has landed for `STALE_THRESHOLD` seconds, both as a
+      reachability check and to re-sync the device list once data resumes.
     """
 
     config_entry: AuraMonConfigEntry
@@ -72,32 +77,40 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
         """Initialize the coordinator."""
         self.client = client
 
-        # Last datalog timestamp we've folded into the accumulated energy totals.
-        self._last_ts: int | None = None
-        self._interval = DEFAULT_UPDATE_INTERVAL
-
-        # Cached GET /status response and the monotonic time it was fetched at. /status is
-        # only refetched every STATUS_UPDATE_INTERVAL (see class docstring); in between,
-        # this cache is reused for device names, version, network/mac, and datalog.interval.
         self._status: StatusResponse | None = None
-        self._status_fetched_at: float | None = None
-        # Running per-device energy totals (Wh), since the /energy endpoint only reports
-        # per-interval deltas rather than a cumulative value.
+        self._known_devices: set[str] = set()
+        self._status_refresh_inflight = False
+
+        # Running per-device energy totals (Wh). The webhook payload's `wh` field is a
+        # per-interval delta, not a running total (see WEBHOOK_INGESTION.md §2), so it's
+        # accumulated here exactly like the old polling coordinator did with `/energy`.
         self._energy_totals: dict[str, float] = {}
         self._seeded_energy: set[str] = set()
-        # Last known per-device electrical readings (V/A/PF/W) and Hz, from /energy.
-        # /status only gives an instantaneous snapshot that isn't what's logged, so all
-        # live readings come from /energy's interval-aggregated values instead. These
-        # persist across polls where no new /energy row has landed yet.
-        self._latest_readings: dict[str, DeviceEnergy] = {}
+        self._latest_readings: dict[str, _Reading] = {}
         self._latest_hz: float = 0.0
+
+        self._last_webhook_at: float | None = None
+        self._stale = False
 
         super().__init__(
             hass=hass,
             logger=_LOGGER,
             config_entry=entry,
             name=entry.title,
-            update_interval=timedelta(seconds=DEFAULT_UPDATE_INTERVAL),
+            # Push-driven: there is no polling update_interval. Data is only published via
+            # async_set_updated_data(), from handle_payload() or a status refresh.
+            update_interval=None,
+        )
+
+        entry.async_on_unload(
+            async_track_time_interval(
+                hass, self._async_periodic_status_refresh, timedelta(seconds=STATUS_REFRESH_INTERVAL)
+            )
+        )
+        entry.async_on_unload(
+            async_track_time_interval(
+                hass, self._async_check_stale, timedelta(seconds=STALE_CHECK_INTERVAL)
+            )
         )
 
     def seed_energy_total(self, device_name: str, restored_total: float) -> None:
@@ -105,8 +118,8 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
 
         Called once by the energy sensor on startup (from RestoreEntity) so the running
         total continues from where it left off, rather than resetting to zero. Any energy
-        already accumulated this session (e.g. from the very first refresh) is preserved on
-        top of the restored baseline.
+        already accumulated this session (e.g. from a webhook payload that landed before
+        entities finished restoring) is preserved on top of the restored baseline.
         """
         if device_name in self._seeded_energy:
             return
@@ -114,129 +127,139 @@ class AuraMonDataUpdateCoordinator(DataUpdateCoordinator[AuraMonData]):
         total = restored_total + self._energy_totals.get(device_name, 0.0)
         self._energy_totals[device_name] = total
 
-        # The coordinator's first refresh already completed (and published `self.data`)
-        # before entities are added and get a chance to restore/seed their state, so patch
-        # the already-published snapshot in place too. Otherwise the sensor's very first
-        # written state would show the un-seeded (low) total, and only pick up the restored
-        # value after the next poll.
         if self.data is not None and device_name in self.data.devices:
             self.data.devices[device_name].energy_total = total
 
-    async def _async_get_status(self) -> StatusResponse:
-        """Return the device status, refreshing it only every STATUS_UPDATE_INTERVAL.
-
-        /status is used to reconcile the devices and last logged timestamp. It is not
-        necessary to poll this on every update as this information moves slowly.
-        """
-        now_monotonic = time.monotonic()
-        if (
-            self._status is not None
-            and self._status_fetched_at is not None
-            and now_monotonic - self._status_fetched_at < STATUS_UPDATE_INTERVAL
-        ):
-            return self._status
-
+    async def _async_update_data(self) -> AuraMonData:
+        """Fetch the initial /status snapshot. Only ever called once, at setup."""
         try:
             status = await self.client.get_status()
         except CONNECTION_ERRORS as err:
             raise UpdateFailed(f"Error communicating with device: {err}") from err
 
         self._status = status
-        self._status_fetched_at = now_monotonic
+        self._known_devices = {dev.name for dev in status.devices}
+        # Treat setup as "contact", so the staleness watchdog's 5-minute window starts now
+        # rather than firing immediately if the firmware takes a moment to start pushing.
+        self._last_webhook_at = time.monotonic()
 
-        datalog = status.datalog
-        interval = datalog.interval if datalog and datalog.interval else DEFAULT_UPDATE_INTERVAL
-        interval = max(MIN_UPDATE_INTERVAL, min(interval, MAX_UPDATE_INTERVAL))
-        if interval != self._interval:
-            self._interval = interval
-            self.update_interval = timedelta(seconds=interval)
+        return self._build_snapshot()
 
-        last_ts = datalog.last_ts if datalog else 0
+    def handle_payload(self, body: dict) -> None:
+        """Handle a parsed webhook payload (see WEBHOOK_INGESTION.md §2)."""
+        self._last_webhook_at = time.monotonic()
+        self._stale = False
 
-        # If the device's last datalog timestamp went backwards (reboot / SD card reset),
-        # resync instead of trying to fetch a now-invalid range.
-        if self._last_ts is not None and last_ts < self._last_ts:
-            _LOGGER.debug("Datalog timestamp regressed, resyncing energy totals")
-            self._last_ts = None
-
-        # If we've fallen too far behind (e.g. HA was stopped for a while), don't bother
-        # replaying the whole gap row-by-row - just resync close to the device's current
-        # datalog timestamp. Losing some history is fine; we don't want long/expensive
-        # catch-up reads for no reason.
-        if self._last_ts is not None and last_ts - self._last_ts > MAX_CATCH_UP_AGE:
-            _LOGGER.debug("Last sync is over an hour old, skipping ahead")
-            self._last_ts = max(last_ts - CATCH_UP_RESYNC_OFFSET, 0)
-
-        if self._last_ts is None:
-            # First run (or resync): only fetch the most recent interval so we don't replay
-            # the device's entire history into the accumulated energy totals.
-            self._last_ts = max(last_ts - interval, 0)
-
-        return status
-
-    async def _async_update_data(self) -> AuraMonData:
-        """Fetch any new energy data, refreshing /status only every so often."""
-        status = await self._async_get_status()
-        interval = self._interval
-
-        # `limit_ts` is used as a pacing boundary, ensuring the data requested has been logged.
-        now = time.time()
-        limit_ts = int(now // interval) * interval - interval
-
-        start = self._last_ts
-
-        rows: list[EnergyRow] = []
-        attempted = start is not None and start < limit_ts
-        if attempted:
+        if "hz" in body:
             try:
-                rows = await self.client.get_energy(start=start, interval=interval)
-            except CONNECTION_ERRORS as err:
-                raise UpdateFailed(f"Error fetching energy data: {err}") from err
+                self._latest_hz = float(body["hz"])
+            except (TypeError, ValueError):
+                _LOGGER.debug("Ignoring non-numeric hz in webhook payload: %r", body.get("hz"))
 
-        if rows:
-            for row in rows:
-                for name, energy in row.devices.items():
-                    self._energy_totals[name] = (
-                        self._energy_totals.get(name, 0.0) + energy.energy_wh
-                    )
-                if row.timestamp > (self._last_ts or 0):
-                    self._last_ts = row.timestamp
-        elif attempted:
-            # The device had nothing for the requested window (e.g. a gap in the log).
-            # We know for certain there's no data before limit_ts (we waited a full
-            # interval past it before attempting), so skip past the gap up to there
-            # rather than re-requesting the same empty range forever.
-            self._last_ts = limit_ts
+        unknown_device = False
+        for device in body.get("devices") or []:
+            name = device.get("name")
+            if not name:
+                continue
+            try:
+                reading = _Reading(
+                    voltage=float(device["volts"]),
+                    current=float(device["amps"]),
+                    power=float(device["watts"]),
+                    power_factor=float(device["pf"]),
+                )
+                wh = float(device["wh"])
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.debug("Ignoring malformed device entry in webhook payload: %r", device)
+                continue
 
-        if rows:
-            # Merge rather than replace: a malformed/short CSV row (see
-            # AuraMonClient._parse_energy_csv) can omit a device that's still present in
-            # /status, and we don't want that device's reading to flicker to 0 because of it.
-            self._latest_readings.update(rows[-1].devices)
-            self._latest_hz = rows[-1].hz
+            self._latest_readings[name] = reading
+            self._energy_totals[name] = self._energy_totals.get(name, 0.0) + wh
 
-        # /status is only used here for the set of configured device names (refreshed at
-        # most every STATUS_UPDATE_INTERVAL, see _async_get_status); the actual electrical
-        # readings come exclusively from /energy (see _latest_readings above), since
-        # /energy's interval-aggregated values match what's logged, unlike /status's
-        # instantaneous snapshot.
-        devices: dict[str, AuraMonDeviceData] = {
-            dev.name: AuraMonDeviceData(
-                name=dev.name,
-                voltage=self._latest_readings.get(dev.name, _EMPTY_READING).voltage,
-                current=self._latest_readings.get(dev.name, _EMPTY_READING).current,
-                power_factor=self._latest_readings.get(
-                    dev.name, _EMPTY_READING
-                ).power_factor,
-                power=self._latest_readings.get(dev.name, _EMPTY_READING).power,
-                energy_total=self._energy_totals.get(dev.name, 0.0),
+            if name not in self._known_devices:
+                unknown_device = True
+                # Show the new device immediately rather than waiting for the debounced
+                # /status refresh below to complete; a later refresh will prune it again if
+                # it turns out not to be a real configured device.
+                self._known_devices.add(name)
+
+        self.async_set_updated_data(self._build_snapshot())
+
+        if unknown_device:
+            self._schedule_status_refresh("unknown device in webhook payload")
+
+    def _build_snapshot(self) -> AuraMonData:
+        """Build a snapshot from the current /status cache and latest webhook readings."""
+        devices: dict[str, AuraMonDeviceData] = {}
+        for name in self._known_devices | set(self._latest_readings):
+            reading = self._latest_readings.get(name)
+            devices[name] = AuraMonDeviceData(
+                name=name,
+                voltage=reading.voltage if reading else 0.0,
+                current=reading.current if reading else 0.0,
+                power_factor=reading.power_factor if reading else 0.0,
+                power=reading.power if reading else 0.0,
+                energy_total=self._energy_totals.get(name, 0.0),
             )
-            for dev in status.devices
-        }
 
         return AuraMonData(
-            version=status.version,
-            mac=status.network.mac if status.network else "",
+            version=self._status.version if self._status else "",
+            mac=self._status.network.mac if self._status and self._status.network else "",
             hz=self._latest_hz,
             devices=devices,
+            stale=self._stale,
         )
+
+    def _schedule_status_refresh(self, reason: str) -> None:
+        """Kick off a debounced, non-blocking /status refresh."""
+        if self._status_refresh_inflight:
+            return
+        self._status_refresh_inflight = True
+
+        async def _run() -> None:
+            try:
+                await self._async_refresh_status(reason)
+            finally:
+                self._status_refresh_inflight = False
+
+        self.config_entry.async_create_task(self.hass, _run(), f"aura_mon status refresh ({reason})")
+
+    async def _async_refresh_status(self, reason: str) -> None:
+        """Refresh /status and merge the result into the published snapshot."""
+        try:
+            status = await self.client.get_status()
+        except CONNECTION_ERRORS as err:
+            _LOGGER.warning("Failed to refresh AuraMon status (%s): %s", reason, err)
+            return
+
+        self._status = status
+        new_known = {dev.name for dev in status.devices}
+
+        # /status is authoritative for which devices exist. Prune any device that's no
+        # longer configured on the firmware, so its entities get removed (mirrors the old
+        # polling coordinator's behavior, where `devices` was always built from /status).
+        for name in list(self._latest_readings):
+            if name not in new_known:
+                self._latest_readings.pop(name, None)
+                self._energy_totals.pop(name, None)
+        self._known_devices = new_known
+
+        self.async_set_updated_data(self._build_snapshot())
+
+    async def _async_periodic_status_refresh(self, _now) -> None:
+        """Timer callback: unconditional periodic /status refresh."""
+        self._schedule_status_refresh("periodic refresh")
+
+    async def _async_check_stale(self, _now) -> None:
+        """Timer callback: mark unavailable if no webhook payload has landed recently."""
+        if self._last_webhook_at is None or self._stale:
+            return
+        if time.monotonic() - self._last_webhook_at < STALE_THRESHOLD:
+            return
+
+        self._stale = True
+        if self.data is not None:
+            self.async_set_updated_data(self._build_snapshot())
+        # Also check reachability/device-list changes while we're at it - the outcome
+        # doesn't affect `stale` (no push = stale, regardless of reachability).
+        self._schedule_status_refresh("no webhook payload received recently")
