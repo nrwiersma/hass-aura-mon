@@ -22,8 +22,16 @@
   "options": {
     "step": {
       "init": {
-        "description": "This is the webhook URL for this Aura Mon device. Paste it into the device's Home Assistant uploader settings (`url`/`webhook_id`) if it isn't receiving data:\n\n`{webhook_url}`"
+        "data": {
+          "host": "Host"
+        },
+        "description": "Change the IP address or hostname of this Aura Mon device. This is the webhook URL for this Aura Mon device. Paste it into the device's Home Assistant uploader settings (`url`/`webhook_id`) if it isn't receiving data:\n\n`{webhook_url}`"
       }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect. Check the host and that the device is powered on.",
+      "wrong_device": "That host is a different Aura Mon device than the one configured.",
+      "unknown": "Unexpected error"
     }
   },
   "entity": {

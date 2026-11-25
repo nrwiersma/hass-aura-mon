@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import logging
+import time
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -25,12 +26,15 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import AuraMonConfigEntry, AuraMonDataUpdateCoordinator, AuraMonDeviceData
 
 _LOGGER = logging.getLogger(__name__)
+
+MISSING_DEVICE_GRACE_PERIOD = 24 * 60 * 60
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -117,6 +121,61 @@ async def async_setup_entry(
         entities.append(AuraMonEnergySensor(coordinator, device_name, ENERGY_DESCRIPTION))
         return entities
 
+    store: Store[dict[str, float]] = Store(
+        hass, 1, f"{DOMAIN}_{config_entry.entry_id}_missing_devices"
+    )
+    # Device name -> epoch time it was first seen missing. Persisted so restarts don't
+    # reset the grace period.
+    missing_since: dict[str, float] = await store.async_load() or {}
+
+    @callback
+    def _prune_registry() -> None:
+        """Remove registry entries for devices missing from the controller for too long.
+
+        Disabled entities are never added to Home Assistant, so they cannot remove
+        themselves; they are cleaned up here. A device must stay missing for
+        MISSING_DEVICE_GRACE_PERIOD first, so a temporary disappearance is not destructive.
+        """
+        registry = er.async_get(hass)
+        now = time.time()
+        prefix = f"{coordinator.data.mac or config_entry.entry_id}_"
+        suffixes = tuple(
+            f"_{key}"
+            for key in (
+                *(description.key for description in DEVICE_SENSOR_DESCRIPTIONS),
+                ENERGY_DESCRIPTION.key,
+            )
+        )
+
+        absent: dict[str, list[str]] = {}
+        for entry in er.async_entries_for_config_entry(registry, config_entry.entry_id):
+            unique_id = entry.unique_id
+            if not unique_id.startswith(prefix) or not unique_id.endswith(suffixes):
+                continue
+            device_name = unique_id.removeprefix(prefix)
+            for suffix in suffixes:
+                if device_name.endswith(suffix):
+                    device_name = device_name.removesuffix(suffix)
+                    break
+            if device_name not in coordinator.data.devices:
+                absent.setdefault(device_name, []).append(entry.entity_id)
+
+        original = dict(missing_since)
+        for device_name in list(missing_since):
+            if device_name not in absent:
+                del missing_since[device_name]
+        for device_name, entity_ids in absent.items():
+            first_missing = missing_since.setdefault(device_name, now)
+            if now - first_missing >= MISSING_DEVICE_GRACE_PERIOD:
+                for entity_id in entity_ids:
+                    registry.async_remove(entity_id)
+                del missing_since[device_name]
+
+        if missing_since != original:
+            store.async_delay_save(lambda: dict(missing_since), 1)
+
+    _prune_registry()
+
     entities: list[SensorEntity] = [AuraMonFrequencySensor(coordinator, FREQUENCY_DESCRIPTION)]
     for device_name in coordinator.data.devices:
         entities.extend(_create_entities(device_name))
@@ -125,6 +184,7 @@ async def async_setup_entry(
     @callback
     def _new_data_received() -> None:
         """Add entities for any devices that appeared after initial setup."""
+        _prune_registry()
         new_entities: list[SensorEntity] = []
         for device_name in coordinator.data.devices:
             if device_name not in created:
@@ -167,7 +227,8 @@ class AuraMonSensor(CoordinatorEntity[AuraMonDataUpdateCoordinator], SensorEntit
         self.entity_description = entity_description
         mac = coordinator.data.mac or coordinator.config_entry.entry_id
         self._attr_unique_id = f"{mac}_{device_name}_{entity_description.key}"
-        self._attr_name = device_name
+        label = entity_description.key.replace("_", " ").capitalize()
+        self._attr_name = f"{device_name} {label}"
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -182,19 +243,6 @@ class AuraMonSensor(CoordinatorEntity[AuraMonDataUpdateCoordinator], SensorEntit
             and self._device_name in self.coordinator.data.devices
             and not self.coordinator.data.stale
         )
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator.
-
-        Removes this entity if its device has disappeared from /status (e.g. disabled or
-        unassigned in the device's configuration), rather than leaving it unavailable
-        forever.
-        """
-        if self._device_name not in self.coordinator.data.devices:
-            er.async_get(self.hass).async_remove(self.entity_id)
-            return
-        super()._handle_coordinator_update()
 
     @property
     def native_value(self) -> float | None:

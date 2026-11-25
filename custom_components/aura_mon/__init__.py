@@ -54,7 +54,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: AuraMonConfigEntry) -> b
     ha_webhook.async_register(hass, DOMAIN, entry.title, webhook_id, handle_webhook)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: AuraMonConfigEntry) -> None:
+    """Reload the entry so a changed host takes effect."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: AuraMonConfigEntry) -> bool:

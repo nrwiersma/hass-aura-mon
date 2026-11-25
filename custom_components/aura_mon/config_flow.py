@@ -111,19 +111,37 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    """Options flow that just re-displays the entry's webhook URL.
+    """Options flow to change the device host and re-display the webhook URL.
 
-    There's nothing to actually configure - this exists purely so the webhook URL (shown
-    only once, during initial setup) is always reachable afterwards via the integration's
-    "Configure" button, rather than relying on a one-time notification/log line.
+    The webhook URL is shown only once during initial setup, so it is repeated here to
+    keep it reachable via the integration's "Configure" button.
     """
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Show the webhook URL."""
+        """Edit the host and show the webhook URL."""
+        errors: dict[str, str] = {}
+
         if user_input is not None:
-            return self.async_create_entry(title="", data={})
+            host = user_input[CONF_HOST]
+            try:
+                mac = await _validate_input(self.hass, host)
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+            else:
+                if self.config_entry.unique_id not in (None, mac):
+                    errors["base"] = "wrong_device"
+                else:
+                    self.hass.config_entries.async_update_entry(
+                        self.config_entry,
+                        title=host,
+                        data={**self.config_entry.data, CONF_HOST: host},
+                    )
+                    return self.async_create_entry(title="", data={})
 
         webhook_id = self.config_entry.data.get(CONF_WEBHOOK_ID)
         webhook_url = (
@@ -131,9 +149,11 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             if webhook_id
             else "Not yet generated - reload the integration to generate one."
         )
+        current_host = (user_input or self.config_entry.data).get(CONF_HOST)
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema({}),
+            data_schema=vol.Schema({vol.Required(CONF_HOST, default=current_host): str}),
+            errors=errors,
             description_placeholders={"webhook_url": webhook_url},
         )
 
